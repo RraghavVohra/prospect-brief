@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Prospect Brief Engine</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
+  <style>
+    :root {
+      --bg: #f6f7f9; --panel: #fff; --text: #1d2330; --muted: #6b7280;
+      --border: #e3e6eb; --accent: #2f6fed; --think: #f3f0ff; --tool: #eef6ff; --error: #c0392b;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #12151b; --panel: #1b1f27; --text: #e6e8ec; --muted: #9aa1ad;
+        --border: #2b313c; --accent: #6b9bff; --think: #241f38; --tool: #1a2738; --error: #ff6b5b;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); }
+    header { padding: 16px 24px; border-bottom: 1px solid var(--border); }
+    header h1 { margin: 0; font-size: 1.2rem; }
+    main { display: grid; grid-template-columns: 300px 1fr 1.3fr; gap: 16px; padding: 16px; height: calc(100vh - 58px); }
+    section { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; overflow-y: auto; }
+    h2 { margin: 0 0 12px; font-size: .95rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+    label { display: block; font-size: .85rem; margin: 12px 0 4px; }
+    input, textarea { width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font: inherit; }
+    textarea { resize: vertical; min-height: 70px; }
+    button { margin-top: 16px; width: 100%; padding: 10px; border: 0; border-radius: 6px; background: var(--accent); color: #fff; font-weight: 600; cursor: pointer; }
+    button:disabled { opacity: .5; cursor: wait; }
+    #status { margin-top: 12px; font-size: .85rem; color: var(--muted); }
+    .step { margin-bottom: 10px; padding: 8px 10px; border-radius: 6px; font-size: .85rem; white-space: pre-wrap; }
+    .thinking { background: var(--think); }
+    .tool { background: var(--tool); }
+    .tool a { color: var(--accent); display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .error { color: var(--error); }
+    .label { font-weight: 600; display: block; margin-bottom: 4px; }
+    #brief { line-height: 1.55; }
+    #brief a { color: var(--accent); }
+    #brief blockquote { margin: 8px 0; padding-left: 12px; border-left: 3px solid var(--accent); color: var(--muted); }
+    .placeholder { color: var(--muted); }
+    @media (max-width: 900px) { main { grid-template-columns: 1fr; height: auto; } }
+  </style>
+</head>
+<body>
+  <header><h1>Prospect Brief Engine</h1></header>
+  <main>
+    <section>
+      <h2>Prospect</h2>
+      <form id="form">
+        <label for="name">Name</label>
+        <input id="name" required placeholder="Jane Doe" />
+        <label for="company">Company</label>
+        <input id="company" required placeholder="Acme Corp" />
+        <label for="role">Current role</label>
+        <input id="role" required placeholder="VP of Sales" />
+        <label for="notes">Notes (optional)</label>
+        <textarea id="notes" placeholder="LinkedIn URL, location, meeting goal..."></textarea>
+        <button id="submit" type="submit">Generate brief</button>
+      </form>
+      <div id="status"></div>
+    </section>
+
+    <section>
+      <h2>Reasoning &amp; research</h2>
+      <div id="reasoning"><p class="placeholder">Live reasoning and web searches show up here.</p></div>
+    </section>
+
+    <section>
+      <h2>Brief</h2>
+      <div id="brief"><p class="placeholder">Your brief will appear here.</p></div>
+    </section>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const form = $("form"), submitBtn = $("submit"), statusEl = $("status");
+    const reasoningEl = $("reasoning"), briefEl = $("brief");
+
+    let socket = null;
+    let thinkingBox = null;   // current thinking block being streamed into
+    let briefText = "";       // raw Markdown of the brief streamed so far
+    const toolBoxes = {};     // tool_call id -> element
+
+    // ---------- WebSocket ----------
+    function connect() {
+      return new Promise((resolve, reject) => {
+        if (socket && socket.readyState === WebSocket.OPEN) return resolve(socket);
+        const scheme = location.protocol === "https:" ? "wss" : "ws";
+        socket = new WebSocket(`${scheme}://${location.host}/ws/brief`);
+        socket.onopen = () => resolve(socket);
+        socket.onerror = () => reject(new Error("Could not connect to server"));
+        socket.onclose = () => setBusy(false);
+        socket.onmessage = (msg) => handleEvent(JSON.parse(msg.data));
+      });
+    }
+
+    function handleEvent(event) {
+      switch (event.type) {
+        case "status":
+          statusEl.textContent = event.message;
+          break;
+
+        case "thinking":
+          if (!thinkingBox) thinkingBox = addStep("thinking", "Thinking");
+          thinkingBox.body.textContent += event.text;
+          scrollToEnd(reasoningEl);
+          break;
+
+        case "text":
+          thinkingBox = null;
+          briefText += event.text;
+          renderBrief();
+          break;
+
+        case "tool_call": {
+          thinkingBox = null;
+          // Any text written before a tool call was an interim note, not the brief.
+          if (briefText.trim()) addStep("thinking", "Note").body.textContent = briefText;
+          briefText = "";
+          renderBrief();
+          const box = addStep("tool", "🔎 Searching");
+          box.body.textContent = event.query;
+          toolBoxes[event.id] = box;
+          break;
+        }
+
+        case "tool_result": {
+          const box = toolBoxes[event.id];
+          if (!box) break;
+          if (event.error) {
+            box.title.textContent = "⚠️ Search failed";
+            box.body.append(document.createElement("br"), event.error);
+            break;
+          }
+          box.title.textContent = `✅ Searched (${event.sources.length} sources)`;
+          for (const src of event.sources.slice(0, 5)) {
+            const a = document.createElement("a");
+            a.href = src.url; a.target = "_blank"; a.rel = "noopener";
+            a.textContent = src.title || src.url;
+            box.root.append(a);
+          }
+          break;
+        }
+
+        case "done":
+          briefText = event.brief;
+          renderBrief();
+          statusEl.textContent = "Done ✔";
+          setBusy(false);
+          break;
+
+        case "error":
+          statusEl.innerHTML = "";
+          statusEl.append(Object.assign(document.createElement("span"), { className: "error", textContent: event.message }));
+          setBusy(false);
+          break;
+      }
+    }
+
+    // ---------- UI helpers ----------
+    function addStep(kind, titleText) {
+      const root = document.createElement("div");
+      root.className = `step ${kind}`;
+      const title = Object.assign(document.createElement("span"), { className: "label", textContent: titleText });
+      const body = document.createElement("span");
+      root.append(title, body);
+      reasoningEl.append(root);
+      scrollToEnd(reasoningEl);
+      return { root, title, body };
+    }
+
+    function renderBrief() {
+      briefEl.innerHTML = briefText
+        ? DOMPurify.sanitize(marked.parse(briefText))
+        : '<p class="placeholder">Researching…</p>';
+      briefEl.querySelectorAll("a").forEach((a) => { a.target = "_blank"; a.rel = "noopener"; });
+    }
+
+    function scrollToEnd(el) { el.parentElement.scrollTop = el.parentElement.scrollHeight; }
+
+    function setBusy(busy) { submitBtn.disabled = busy; }
+
+    function resetOutput() {
+      reasoningEl.innerHTML = "";
+      briefText = "";
+      thinkingBox = null;
+      renderBrief();
+    }
+
+    // ---------- Submit ----------
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      setBusy(true);
+      resetOutput();
+      statusEl.textContent = "Connecting…";
+      try {
+        const ws = await connect();
+        ws.send(JSON.stringify({
+          name: $("name").value,
+          company: $("company").value,
+          role: $("role").value,
+          notes: $("notes").value,
+        }));
+      } catch (err) {
+        handleEvent({ type: "error", message: err.message });
+      }
+    });
+  </script>
+</body>
+</html>
